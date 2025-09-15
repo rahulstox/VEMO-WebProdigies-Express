@@ -161,8 +161,11 @@ io.on("connection", (socket) => {
 
       const filePath = session.filePath;
 
+      const base =
+        process.env.NEXT_API_HOST?.replace(/\/$/, "") ||
+        "http://localhost:3000";
       const processing = await axios.post(
-        `${process.env.NEXT_API_HOST}recording/${data.userId}/processing`,
+        `${base}/api/recording/${data.userId}/processing`,
         { filename: sanitizedFilename }
       );
 
@@ -230,7 +233,7 @@ io.on("connection", (socket) => {
                 console.log("🟢 Title/Summary generation successful.");
 
                 await axios.post(
-                  `${process.env.NEXT_API_HOST}recording/${data.userId}/transcribe`,
+                  `${base}/api/recording/${data.userId}/transcribe`,
                   {
                     filename: sanitizedFilename,
                     content: JSON.stringify(parsedContent), // Ensure it's a valid JSON string
@@ -244,10 +247,9 @@ io.on("connection", (socket) => {
           }
         }
 
-        await axios.post(
-          `${process.env.NEXT_API_HOST}recording/${data.userId}/complete`,
-          { filename: sanitizedFilename }
-        );
+        await axios.post(`${base}/api/recording/${data.userId}/complete`, {
+          filename: sanitizedFilename,
+        });
       } catch (postUploadError) {
         console.error("🔴 Error in post-upload logic:", postUploadError);
         socket.emit("upload-error", {
