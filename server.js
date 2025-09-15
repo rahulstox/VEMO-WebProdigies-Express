@@ -1,6 +1,6 @@
 const express = require("express");
 const cors = require("cors");
-const { Server } = require('socket.io');
+const { Server } = require("socket.io");
 const fs = require("fs");
 const http = require("http");
 const dotenv = require("dotenv");
@@ -11,7 +11,7 @@ const path = require("path");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 dotenv.config();
 const app = express();
-app.use(cors())
+app.use(cors());
 
 const server = http.createServer(app);
 
@@ -22,7 +22,6 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 // const openai = new OpenAi({
 //   apiKey: process.env.GEMINI_API_KEY,
 // })
-
 
 // // Set axios default headers
 // axios.defaults.headers.common["origin"] = 'https://opal-express-gc8f.onrender.com';
@@ -38,18 +37,29 @@ cloudinary.config({
 // Socket.IO configuration with better error handling
 const io = new Server(server, {
   cors: {
-      origin: '*',
-      methods: ["GET", "POST"],
+    origin: "*",
+    methods: ["GET", "POST"],
   },
-})
+});
 // Ensure temp_upload directory exists
-const uploadDir = path.join(__dirname, 'temp_upload');
+const uploadDir = path.join(__dirname, "temp_upload");
 if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir, { recursive: true });
 }
 
-// Store chunks per socket connection
-const socketChunks = new Map();
+// Per-socket session state
+// socket.id -> {
+//   [filename]: {
+//     filePath: string,
+//     fileStream: fs.WriteStream,
+//     cloudStream: NodeJS.WritableStream,
+//     cloudDone: Promise<{ url: string }>,
+//     cloudResolve: Function,
+//     cloudReject: Function,
+//     bytes: number
+//   }
+// }
+const socketSessions = new Map();
 
 // Helper function to convert file for Gemini (async version)
 async function fileToGenerativePart(filePath, mimeType) {
@@ -64,36 +74,92 @@ async function fileToGenerativePart(filePath, mimeType) {
 
 io.on("connection", (socket) => {
   console.log("🟢 Socket connected:", socket.id);
-  socketChunks.set(socket.id, []);
+  socketSessions.set(socket.id, {});
   socket.emit("connected");
 
   socket.on("video-chunks", (data) => {
     try {
-      console.log("🟢 Receiving video chunk for:", data.filename);
-      const chunks = socketChunks.get(socket.id);
-      chunks.push(data.chunks);
+      const { filename, chunks, seq } = data;
+      const sanitizedFilename = path.basename(filename);
+      const sessions = socketSessions.get(socket.id) || {};
+      let session = sessions[sanitizedFilename];
+      if (!session) {
+        const filePath = path.join(uploadDir, sanitizedFilename);
+        const fileStream = fs.createWriteStream(filePath);
+
+        let cloudResolve;
+        let cloudReject;
+        const cloudDone = new Promise((res, rej) => {
+          cloudResolve = res;
+          cloudReject = rej;
+        });
+        const cloudStream = cloudinary.uploader.upload_stream(
+          {
+            resource_type: "video",
+            folder: "opal",
+            public_id: sanitizedFilename,
+          },
+          (error, result) => {
+            if (error) return cloudReject(error);
+            cloudResolve({ url: result.secure_url });
+          }
+        );
+
+        session = {
+          filePath,
+          fileStream,
+          cloudStream,
+          cloudDone,
+          cloudResolve,
+          cloudReject,
+          bytes: 0,
+        };
+        sessions[sanitizedFilename] = session;
+        socketSessions.set(socket.id, sessions);
+      }
+
+      const buffer = Buffer.isBuffer(chunks) ? chunks : Buffer.from(chunks); // ArrayBuffer -> Buffer
+
+      session.bytes += buffer.length;
+      const okFile = session.fileStream.write(buffer);
+      const okCloud = session.cloudStream.write(buffer);
+
+      // emit progress (~bytes only; client can extrapolate)
+      socket.emit("server-progress", {
+        filename: sanitizedFilename,
+        bytes: session.bytes,
+      });
+
+      // ACK this seq so client can send the next chunk
+      socket.emit("ack", { seq });
+
+      if (!okFile) {
+        session.fileStream.once("drain", () => {});
+      }
+      if (!okCloud) {
+        session.cloudStream.once("drain", () => {});
+      }
     } catch (error) {
-      console.error("🔴 Error collecting video chunk:", error);
+      console.error("🔴 Error receiving video chunk:", error);
     }
   });
 
   socket.on("process-video", async (data) => {
-    // ---- SECURITY IMPROVEMENT ----
-    const sanitizedFilename = path.basename(data.filename); // Sirf filename use karein
-    const filePath = path.join(uploadDir, sanitizedFilename);
-    const chunks = socketChunks.get(socket.id);
+    const sanitizedFilename = path.basename(data.filename);
+    const sessions = socketSessions.get(socket.id) || {};
+    const session = sessions[sanitizedFilename];
 
     try {
-      if (!chunks || chunks.length === 0) {
-        throw new Error("No video chunks received to process.");
+      if (!session) {
+        throw new Error("No active session for this filename.");
       }
 
-      // ---- PERFORMANCE IMPROVEMENT (Async file write) ----
-      console.log("🟢 Writing complete video file to disk...");
-      const videoBlob = new Blob(chunks, { type: "video/webm; codecs=vp9" });
-      const buffer = Buffer.from(await videoBlob.arrayBuffer());
-      await fs.promises.writeFile(filePath, buffer); // writeFile (async)
-      console.log("🟢 File written successfully:", sanitizedFilename);
+      // finalize streams
+      await new Promise((res) => session.fileStream.end(res));
+      await new Promise((res) => session.cloudStream.end(res));
+      const { url } = await session.cloudDone; // wait for Cloudinary
+
+      const filePath = session.filePath;
 
       const processing = await axios.post(
         `${process.env.NEXT_API_HOST}recording/${data.userId}/processing`,
@@ -104,102 +170,135 @@ io.on("connection", (socket) => {
         throw new Error("Failed to create processing file in the main app");
       }
 
-      const cloudinaryUpload = cloudinary.uploader.upload_stream(
-        { resource_type: "video", folder: "opal", public_id: sanitizedFilename },
-        async (error, result) => {
-          if (error) {
-            console.error("🔴 Cloudinary upload error:", error);
-            socket.emit("upload-error", { message: "Video upload failed." });
-            return;
-          }
-          try {
-            console.log("🟢 Video uploaded to Cloudinary:", result.secure_url);
+      try {
+        console.log("🟢 Video uploaded to Cloudinary:", url);
 
-            if (processing.data.plan === 'PRO') {
-              // ---- PERFORMANCE IMPROVEMENT (Async file stat) ----
-              const fileStat = await fs.promises.stat(filePath);
-              if (fileStat.size < 25 * 1024 * 1024) { // 25MB limit
-                
+        if (processing.data.plan === "PRO") {
+          // ---- PERFORMANCE IMPROVEMENT (Async file stat) ----
+          const fileStat = await fs.promises.stat(filePath);
+          if (fileStat.size < 25 * 1024 * 1024) {
+            // 25MB limit
+
+            try {
+              console.log("🟢 Transcribing with Gemini...");
+              const transcriptionModel = genAI.getGenerativeModel({
+                model: "gemini-1.5-pro-latest",
+              });
+              // ---- PERFORMANCE IMPROVEMENT (Async file read in helper) ----
+              const audioFilePart = await fileToGenerativePart(
+                filePath,
+                "video/webm"
+              );
+              const transcriptionPrompt =
+                "Transcribe this audio file accurately. Provide only the text of the transcription, nothing else.";
+              const transcriptionResult =
+                await transcriptionModel.generateContent([
+                  transcriptionPrompt,
+                  audioFilePart,
+                ]);
+              const transcription = (await transcriptionResult.response).text();
+              console.log("🟢 Transcription successful.");
+
+              if (transcription) {
+                console.log("🟢 Generating title/summary with Gemini...");
+                const summaryModel = genAI.getGenerativeModel({
+                  model: "gemini-pro",
+                });
+                const summaryPrompt = `Based on the following transcription, generate a concise title and a helpful summary. Transcription: "${transcription}". Return your response in a valid JSON format like this: {"title": "Your Title", "summary": "Your Summary"}`;
+                const summaryResult = await summaryModel.generateContent(
+                  summaryPrompt
+                );
+                const generatedContentText = (
+                  await summaryResult.response
+                ).text();
+
+                // ---- ROBUSTNESS IMPROVEMENT (Safely parse JSON) ----
+                let parsedContent;
                 try {
-                  console.log("🟢 Transcribing with Gemini...");
-                  const transcriptionModel = genAI.getGenerativeModel({ model: "gemini-1.5-pro-latest" });
-                  // ---- PERFORMANCE IMPROVEMENT (Async file read in helper) ----
-                  const audioFilePart = await fileToGenerativePart(filePath, "video/webm");
-                  const transcriptionPrompt = "Transcribe this audio file accurately. Provide only the text of the transcription, nothing else.";
-                  const transcriptionResult = await transcriptionModel.generateContent([transcriptionPrompt, audioFilePart]);
-                  const transcription = (await transcriptionResult.response).text();
-                  console.log("🟢 Transcription successful.");
-
-                  if (transcription) {
-                    console.log("🟢 Generating title/summary with Gemini...");
-                    const summaryModel = genAI.getGenerativeModel({ model: "gemini-pro" });
-                    const summaryPrompt = `Based on the following transcription, generate a concise title and a helpful summary. Transcription: "${transcription}". Return your response in a valid JSON format like this: {"title": "Your Title", "summary": "Your Summary"}`;
-                    const summaryResult = await summaryModel.generateContent(summaryPrompt);
-                    const generatedContentText = (await summaryResult.response).text();
-
-                    // ---- ROBUSTNESS IMPROVEMENT (Safely parse JSON) ----
-                    let parsedContent;
-                    try {
-                      parsedContent = JSON.parse(generatedContentText);
-                    } catch (parseError) {
-                      console.error("🔴 Failed to parse Gemini JSON response:", parseError);
-                      parsedContent = { title: "AI Generated Title", summary: transcription.substring(0, 200) + "..." }; // Fallback
-                    }
-
-                    console.log("🟢 Title/Summary generation successful.");
-
-                    await axios.post(
-                      `${process.env.NEXT_API_HOST}recording/${data.userId}/transcribe`,
-                      {
-                        filename: sanitizedFilename,
-                        content: JSON.stringify(parsedContent), // Ensure it's a valid JSON string
-                        transcript: transcription,
-                      }
-                    );
-                  }
-                } catch (aiError) {
-                  console.error("🔴 Error during Gemini processing:", aiError);
+                  parsedContent = JSON.parse(generatedContentText);
+                } catch (parseError) {
+                  console.error(
+                    "🔴 Failed to parse Gemini JSON response:",
+                    parseError
+                  );
+                  parsedContent = {
+                    title: "AI Generated Title",
+                    summary: transcription.substring(0, 200) + "...",
+                  }; // Fallback
                 }
-              }
-            }
 
-            await axios.post(
-              `${process.env.NEXT_API_HOST}recording/${data.userId}/complete`,
-              { filename: sanitizedFilename }
-            );
-            
-          } catch (postUploadError) {
-            console.error("🔴 Error in post-upload logic:", postUploadError);
-            socket.emit("upload-error", { message: "Failed to process AI features." });
-          } finally {
-            // Clean up temporary file
-            await fs.promises.unlink(filePath);
-            console.log("🟢 Deleted temp file:", sanitizedFilename);
+                console.log("🟢 Title/Summary generation successful.");
+
+                await axios.post(
+                  `${process.env.NEXT_API_HOST}recording/${data.userId}/transcribe`,
+                  {
+                    filename: sanitizedFilename,
+                    content: JSON.stringify(parsedContent), // Ensure it's a valid JSON string
+                    transcript: transcription,
+                  }
+                );
+              }
+            } catch (aiError) {
+              console.error("🔴 Error during Gemini processing:", aiError);
+            }
           }
         }
-      );
-      fs.createReadStream(filePath).pipe(cloudinaryUpload);
+
+        await axios.post(
+          `${process.env.NEXT_API_HOST}recording/${data.userId}/complete`,
+          { filename: sanitizedFilename }
+        );
+      } catch (postUploadError) {
+        console.error("🔴 Error in post-upload logic:", postUploadError);
+        socket.emit("upload-error", {
+          message: "Failed to process AI features.",
+        });
+      } finally {
+        // Clean up temporary file
+        try {
+          await fs.promises.unlink(filePath);
+        } catch {}
+        console.log("🟢 Deleted temp file:", sanitizedFilename);
+        // clear session
+        delete sessions[sanitizedFilename];
+      }
     } catch (error) {
       console.error("🔴 Error in process-video event:", error.message);
-      socket.emit("upload-error", { message: "An unexpected server error occurred." });
-      // Agar error aaye to temp file delete karein
-      if (fs.existsSync(filePath)) {
+      socket.emit("upload-error", {
+        message: "An unexpected server error occurred.",
+      });
+      const filePath = session?.filePath;
+      if (filePath && fs.existsSync(filePath)) {
         await fs.promises.unlink(filePath);
         console.log("🟢 Cleaned up temp file after error.");
       }
     } finally {
-        socketChunks.set(socket.id, []);
+      socketSessions.set(socket.id, sessions);
     }
   });
 
   socket.on("disconnect", () => {
     console.log("🔴 Socket disconnected:", socket.id);
-    socketChunks.delete(socket.id);
+    const sessions = socketSessions.get(socket.id) || {};
+    Object.values(sessions).forEach((s) => {
+      try {
+        s.fileStream?.destroy();
+      } catch {}
+      try {
+        s.cloudStream?.destroy();
+      } catch {}
+      if (s.filePath && fs.existsSync(s.filePath)) {
+        try {
+          fs.unlinkSync(s.filePath);
+        } catch {}
+      }
+    });
+    socketSessions.delete(socket.id);
   });
 });
 // Error handling for unhandled rejections
-process.on('unhandledRejection', (error) => {
-  console.error('🔴 Unhandled Rejection:', error);
+process.on("unhandledRejection", (error) => {
+  console.error("🔴 Unhandled Rejection:", error);
 });
 
 // Start server
